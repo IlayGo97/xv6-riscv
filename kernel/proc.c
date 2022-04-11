@@ -654,3 +654,48 @@ procdump(void)
     printf("\n");
   }
 }
+
+int
+pause_system(int seconds)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if((p != myproc()->parent) && (p->pid != 1)) {
+      p->chan = (void*)&seconds;
+      if(p->state == RUNNING)
+        p->state = RUNNABLE;
+    }
+  }
+
+  uint ticks0;
+  acquire(&tickslock);
+  ticks0 = ticks;
+  while(ticks - ticks0 < seconds * 10) {
+    if(myproc()->killed) {
+      release(&tickslock);
+      return -1;
+    }
+    sleep(&ticks, &tickslock);
+  }
+  release(&tickslock);
+
+  for(p = proc; p < &proc[NPROC]; p++)
+    if((p != myproc()->parent) && (p->pid != 1))
+      p->chan = 0;
+  return 0;
+}
+
+int
+kill_system(void)
+{
+  struct proc *p;
+  struct proc *my_p = myproc();
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if((p != my_p) && (p->pid != 1) && (p != my_p->parent)) {
+      if(kill(p->pid) < 0)
+        return -1;
+    }
+  }
+  return 0;
+}

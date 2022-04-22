@@ -469,6 +469,16 @@ scheduler(void)
 #endif
 #ifdef SJF //make qemu SCHEDFLAG=SJF
 void
+safe_release(struct spinlock *lck) {
+  if(holding(lck))
+    release(lck);
+}
+void
+safe_aquire(struct spinlock *lck) {
+  if(!holding(lck))
+    acquire(lck);
+}
+void
 scheduler(void)
 {
   struct proc *min_p = 0;
@@ -477,37 +487,41 @@ scheduler(void)
   
   c->proc = 0;
   for(;;){
-    printf("HI");
     intr_on();
     // Avoid deadlock by ensuring that devices can interrupt.
     for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
+      safe_aquire(&p->lock);
       if(p->state == RUNNABLE){
-        if(min_p == 0 || p->mean_ticks < min_p->mean_ticks)
+        if(min_p == 0 || p->mean_ticks < min_p->mean_ticks) {
+          if(min_p != 0)
+           safe_release(&min_p->lock);
+          safe_release(&p->lock);
           min_p = p;
-        else
-          release(&p->lock);
+          safe_aquire(&min_p->lock);
+          continue;
+        }
       }
+      release(&p->lock);
     }
+    safe_aquire(&min_p->lock);
     // Switch to chosen process.  It is the process's job
     // to release its lock and then reacquire it
     // before jumping back to us.
     min_p->state = RUNNING;
     c->proc = min_p;
     uint ticks0;
-    acquire(&tickslock);
+    // acquire(&tickslock);
     ticks0 = ticks;
-    release(&tickslock);
+    // release(&tickslock);
     swtch(&c->context, &min_p->context);
-    acquire(&tickslock);
-    min_p->last_ticks = ticks - ticks0;
+    // acquire(&tickslock);
+    min_p->last_ticks = ticks - ticks0 + 1;
     min_p->mean_ticks = ((10 - RATE) * min_p->mean_ticks + min_p->last_ticks * (RATE)) / 10;
-    printf("setting ticks to: %d", min_p->mean_ticks);
-    release(&tickslock);
+    // release(&tickslock);
     c->proc = 0;
     // Process is done running for now.
     // It should have changed its p->state before coming back.
-    release(&min_p->lock);
+    safe_release(&min_p->lock);
   }
 }
 #endif

@@ -468,60 +468,57 @@ scheduler(void)
 }
 #endif
 #ifdef SJF //make qemu SCHEDFLAG=SJF
-void
-safe_release(struct spinlock *lck) {
-  if(holding(lck))
-    release(lck);
-}
-void
-safe_aquire(struct spinlock *lck) {
-  if(!holding(lck))
-    acquire(lck);
-}
+// void
+// safe_release(struct spinlock *lck) {
+//   if(holding(lck))
+//     release(lck);
+// }
+// void
+// safe_acquire(struct spinlock *lck) {
+//   if(!holding(lck))
+//     acquire(lck);
+// }
 void
 scheduler(void)
 {
-  struct proc *min_p = 0;
   struct proc *p;
+  struct proc *p_min = 0;
   struct cpu *c = mycpu();
   
   c->proc = 0;
   for(;;){
     intr_on();
-    // Avoid deadlock by ensuring that devices can interrupt.
     for(p = proc; p < &proc[NPROC]; p++) {
-      safe_aquire(&p->lock);
-      if(p->state == RUNNABLE){
-        if(min_p == 0 || p->mean_ticks < min_p->mean_ticks) {
-          if(min_p != 0)
-           safe_release(&min_p->lock);
-          safe_release(&p->lock);
-          min_p = p;
-          safe_aquire(&min_p->lock);
-          continue;
-        }
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        if(p_min == 0 || p_min->state != RUNNABLE || p->mean_ticks < p_min->mean_ticks)
+            p_min = p;
+          p_min->state = RUNNING;
+          c->proc = p_min;
+          uint ticks0 = ticks;
+          swtch(&c->context, &p_min->context);
+          c->proc->last_ticks = ticks - ticks0 + 1;
+          c->proc->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
+        // }
+        // else if(p_min->mean_ticks < p->mean_ticks){
+          // release(&p_min->lock);
+          // p_min = p;
+        // }
+        // else release(&p->lock);
+      c->proc = 0;
       }
+      // else release(&p->lock);
       release(&p->lock);
     }
-    safe_aquire(&min_p->lock);
-    // Switch to chosen process.  It is the process's job
-    // to release its lock and then reacquire it
-    // before jumping back to us.
-    min_p->state = RUNNING;
-    c->proc = min_p;
-    uint ticks0;
-    // acquire(&tickslock);
-    ticks0 = ticks;
-    // release(&tickslock);
-    swtch(&c->context, &min_p->context);
-    // acquire(&tickslock);
-    min_p->last_ticks = ticks - ticks0 + 1;
-    min_p->mean_ticks = ((10 - RATE) * min_p->mean_ticks + min_p->last_ticks * (RATE)) / 10;
-    // release(&tickslock);
-    c->proc = 0;
-    // Process is done running for now.
-    // It should have changed its p->state before coming back.
-    safe_release(&min_p->lock);
+    // p_min->state = RUNNING;
+    // c->proc = p_min;
+    // uint ticks0 = ticks;
+    // swtch(&c->context, &p_min->context);
+    // p_min->last_ticks = ticks - ticks0 + 1;
+    // p_min->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
+    // c->proc = 0;
+    // p_min = 0;
+    // release(&p_min->lock);
   }
 }
 #endif

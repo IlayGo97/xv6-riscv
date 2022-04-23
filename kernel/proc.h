@@ -92,8 +92,8 @@ struct proc {
   int killed;                  // If non-zero, have been killed
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
-  int last_ticks;              // Amount of ticks in the last CPU burst.
-  int mean_ticks;              // Amount of mean ticks.
+  uint last_ticks;              // Amount of ticks in the last CPU burst.
+  uint mean_ticks;              // Amount of mean ticks.
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process

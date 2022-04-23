@@ -468,23 +468,13 @@ scheduler(void)
 }
 #endif
 #ifdef SJF //make qemu SCHEDFLAG=SJF
-// void
-// safe_release(struct spinlock *lck) {
-//   if(holding(lck))
-//     release(lck);
-// }
-// void
-// safe_acquire(struct spinlock *lck) {
-//   if(!holding(lck))
-//     acquire(lck);
-// }
 void
 scheduler(void)
 {
   struct proc *p;
   struct proc *p_min = 0;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     intr_on();
@@ -492,27 +482,19 @@ scheduler(void)
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
         if(p_min == 0 || p_min->state != RUNNABLE || p->mean_ticks < p_min->mean_ticks)
-            p_min = p;
-          p_min->state = RUNNING;
-          c->proc = p_min;
-          uint ticks0 = ticks;
-          swtch(&c->context, &p_min->context);
-          c->proc->last_ticks = ticks - ticks0;
-          c->proc->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
-      c->proc = 0;
+          p_min = p;
       }
-      // else release(&p->lock);
       release(&p->lock);
     }
-    // p_min->state = RUNNING;
-    // c->proc = p_min;
-    // uint ticks0 = ticks;
-    // swtch(&c->context, &p_min->context);
-    // p_min->last_ticks = ticks - ticks0 + 1;
-    // p_min->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
-    // c->proc = 0;
-    // p_min = 0;
-    // release(&p_min->lock);
+    acquire(&p_min->lock);
+    p_min->state = RUNNING;
+    c->proc = p_min;
+    uint ticks0 = ticks;
+    swtch(&c->context, &p_min->context);
+    c->proc->last_ticks = ticks - ticks0;
+    c->proc->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
+    c->proc = 0;
+    release(&p_min->lock);
   }
 }
 #endif

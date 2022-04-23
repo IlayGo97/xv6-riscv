@@ -96,6 +96,12 @@ struct proc {
   uint mean_ticks;             // Amount of mean ticks
   uint last_runnable_time;     // Amount of last runnable time
 
+  //stats
+  uint last_change_time;
+  uint sleeping_time;
+  uint runnable_time;
+  uint running_time;
+
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 

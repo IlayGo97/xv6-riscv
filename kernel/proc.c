@@ -245,6 +245,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  p->last_runnable_time = ticks;
 
   release(&p->lock);
 }
@@ -315,6 +316,7 @@ fork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  np->last_runnable_time = ticks;
   release(&np->lock);
 
   return pid;
@@ -442,9 +444,9 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
-  for(;;){
+  for(;;) {
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
@@ -498,6 +500,34 @@ scheduler(void)
   }
 }
 #endif
+#ifdef FCFS
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct proc *p_min = 0;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for(;;) {
+    intr_on();
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        if(p_min == 0 || p_min->state != RUNNABLE || p->last_runnable_time < p_min->last_runnable_time)
+          p_min = p;
+      }
+      release(&p->lock);
+    }
+    acquire(&p_min->lock);
+    p_min->state = RUNNING;
+    c->proc = p_min;
+    swtch(&c->context, &p_min->context);
+    c->proc = 0;
+    release(&p_min->lock);
+  }
+}
+#endif
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -532,6 +562,7 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  p->last_runnable_time = ticks;
   sched();
   release(&p->lock);
 }
@@ -600,6 +631,7 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        p->last_runnable_time = ticks;
       }
       release(&p->lock);
     }
@@ -621,6 +653,7 @@ kill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+        p->last_runnable_time = ticks;
       }
       release(&p->lock);
       return 0;
@@ -697,8 +730,10 @@ pause_system(int seconds)
   for(p = proc; p < &proc[NPROC]; p++) {
     if((p != myproc()->parent) && (p->pid != 1)) {
       p->chan = (void*)&seconds;
-      if(p->state == RUNNING)
+      if(p->state == RUNNING) {
         p->state = RUNNABLE;
+        p->last_runnable_time = ticks; 
+      }
     }
   }
 

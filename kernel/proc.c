@@ -497,14 +497,8 @@ scheduler(void)
           c->proc = p_min;
           uint ticks0 = ticks;
           swtch(&c->context, &p_min->context);
-          c->proc->last_ticks = ticks - ticks0 + 1;
+          c->proc->last_ticks = ticks - ticks0;
           c->proc->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
-        // }
-        // else if(p_min->mean_ticks < p->mean_ticks){
-          // release(&p_min->lock);
-          // p_min = p;
-        // }
-        // else release(&p->lock);
       c->proc = 0;
       }
       // else release(&p->lock);

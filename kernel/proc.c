@@ -64,9 +64,9 @@ change_proc_state(struct proc *p) {
 
 void
 update_mean_stats(struct proc *p) {
-  sleeping_processes_mean = ((sleeping_processes_mean * num_of_procs_in_stats) + p->sleeping_time) * 100 / (num_of_procs_in_stats + 1);
-  running_processes_mean = ((running_processes_mean * num_of_procs_in_stats) + p->runnable_time) * 100 / (num_of_procs_in_stats + 1);
-  running_time_mean = ((running_time_mean * num_of_procs_in_stats) + p->running_time) * 100 / (num_of_procs_in_stats + 1);
+  sleeping_processes_mean = ((sleeping_processes_mean * num_of_procs_in_stats) + p->sleeping_time) / (num_of_procs_in_stats + 1);
+  running_processes_mean = ((running_processes_mean * num_of_procs_in_stats) + p->runnable_time) / (num_of_procs_in_stats + 1);
+  running_time_mean = ((running_time_mean * num_of_procs_in_stats) + p->running_time) / (num_of_procs_in_stats + 1);
   num_of_procs_in_stats++;
 
   program_time += p->running_time;

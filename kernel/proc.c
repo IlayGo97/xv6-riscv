@@ -476,7 +476,7 @@ scheduler(void)
   struct cpu *c = mycpu();
 
   c->proc = 0;
-  for(;;){
+  for(;;) {
     intr_on();
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);

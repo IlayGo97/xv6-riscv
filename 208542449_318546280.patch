@@ -1,0 +1,707 @@
+diff --git a/208542449_318546280.patch b/208542449_318546280.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/Makefile b/Makefile
+index 328f9c6..574a208 100644
+--- a/Makefile
++++ b/Makefile
+@@ -57,6 +57,7 @@ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+ CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
++CFLAGS += -D $(SCHEDFLAG)
+ CFLAGS += -MD
+ CFLAGS += -mcmodel=medany
+ CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
+@@ -79,7 +80,7 @@ $K/kernel: $(OBJS) $K/kernel.ld $U/initcode
+ 	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
+ 
+ $U/initcode: $U/initcode.S
+-	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o
++	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o -D $(POLICY)
+ 	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o $U/initcode.out $U/initcode.o
+ 	$(OBJCOPY) -S -O binary $U/initcode.out $U/initcode
+ 	$(OBJDUMP) -S $U/initcode.o > $U/initcode.asm
+@@ -98,7 +99,7 @@ $U/usys.S : $U/usys.pl
+ 	perl $U/usys.pl > $U/usys.S
+ 
+ $U/usys.o : $U/usys.S
+-	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S
++	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S -D $(POLICY)
+ 
+ $U/_forktest: $U/forktest.o $(ULIB)
+ 	# forktest has less library code linked in - needs to be small
+@@ -132,6 +133,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_syscall\
++	$U/_env\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +156,15 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
++endif
++
++ifndef POLICY
++POLICY := RR
++endif
++
++ifndef SCHEDFLAG
++SCHEDFLAG := DEFAULT
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..39184d2 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -104,6 +104,9 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             pause_system(int seconds);
++int             kill_system(void);
++int             print_stats(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..01f0a6c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -15,6 +15,15 @@ struct proc *initproc;
+ int nextpid = 1;
+ struct spinlock pid_lock;
+ 
++// stats
++uint sleeping_processes_mean = 0;
++uint running_processes_mean = 0;
++uint running_time_mean = 0;
++uint num_of_procs_in_stats = 0;
++uint program_time = 0;
++uint start_time;
++uint cpu_utilization;
++
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+ 
+@@ -42,6 +51,28 @@ proc_mapstacks(pagetable_t kpgtbl) {
+   }
+ }
+ 
++void
++change_proc_state(struct proc *p) {
++  if(p->state == SLEEPING)
++    p->sleeping_time += ticks - p->last_change_time;
++  else if(p->state == RUNNABLE)
++    p->runnable_time += ticks - p->last_change_time;
++  else if(p->state == RUNNING)
++    p->running_time += ticks - p->last_change_time;
++  p->last_change_time = ticks;
++}
++
++void
++update_mean_stats(struct proc *p) {
++  sleeping_processes_mean = ((sleeping_processes_mean * num_of_procs_in_stats) + p->sleeping_time) / (num_of_procs_in_stats + 1);
++  running_processes_mean = ((running_processes_mean * num_of_procs_in_stats) + p->runnable_time) / (num_of_procs_in_stats + 1);
++  running_time_mean = ((running_time_mean * num_of_procs_in_stats) + p->running_time) / (num_of_procs_in_stats + 1);
++  num_of_procs_in_stats++;
++
++  program_time += p->running_time;
++  cpu_utilization = (program_time * 100) / (ticks - start_time);
++}
++
+ // initialize the proc table at boot time.
+ void
+ procinit(void)
+@@ -54,6 +85,7 @@ procinit(void)
+       initlock(&p->lock, "proc");
+       p->kstack = KSTACK((int) (p - proc));
+   }
++  start_time = ticks;
+ }
+ 
+ // Must be called with interrupts disabled,
+@@ -140,6 +172,12 @@ found:
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
++  p->last_ticks = 0;
++  p->mean_ticks = 0;
++  p->runnable_time = 0;
++  p->sleeping_time = 0;
++  p->running_time = 0;
++  p->last_change_time = ticks;
+ 
+   return p;
+ }
+@@ -163,6 +201,12 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->last_ticks = 0;
++  p->mean_ticks = 0;
++  p->runnable_time = 0;
++  p->sleeping_time = 0;
++  p->running_time = 0;
++  p->last_change_time = ticks;
+   p->state = UNUSED;
+ }
+ 
+@@ -242,7 +286,9 @@ userinit(void)
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
++  change_proc_state(p);
+   p->state = RUNNABLE;
++  p->last_runnable_time = ticks;
+ 
+   release(&p->lock);
+ }
+@@ -312,7 +358,9 @@ fork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
++  change_proc_state(p);
+   np->state = RUNNABLE;
++  np->last_runnable_time = ticks;
+   release(&np->lock);
+ 
+   return pid;
+@@ -369,7 +417,9 @@ exit(int status)
+   acquire(&p->lock);
+ 
+   p->xstate = status;
++  change_proc_state(p);
+   p->state = ZOMBIE;
++  update_mean_stats(p);
+ 
+   release(&wait_lock);
+ 
+@@ -434,14 +484,15 @@ wait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++#ifdef DEFAULT
+ void
+ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+-  
++
+   c->proc = 0;
+-  for(;;){
++  for(;;) {
+     // Avoid deadlock by ensuring that devices can interrupt.
+     intr_on();
+ 
+@@ -451,6 +502,7 @@ scheduler(void)
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
++        change_proc_state(p);
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+@@ -463,7 +515,68 @@ scheduler(void)
+     }
+   }
+ }
++#endif
++#ifdef SJF //make qemu SCHEDFLAG=SJF
++void
++scheduler(void)
++{
++  struct proc *p;
++  struct proc *p_min = 0;
++  struct cpu *c = mycpu();
++
++  c->proc = 0;
++  for(;;) {
++    intr_on();
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        if(p_min == 0 || p_min->state != RUNNABLE || p->mean_ticks < p_min->mean_ticks)
++          p_min = p;
++      }
++      release(&p->lock);
++    }
++    acquire(&p_min->lock);
++    change_proc_state(p_min);
++    p_min->state = RUNNING;
++    c->proc = p_min;
++    uint ticks0 = ticks;
++    swtch(&c->context, &p_min->context);
++    c->proc->last_ticks = ticks - ticks0;
++    c->proc->mean_ticks = ((10 - RATE) * p_min->mean_ticks + p_min->last_ticks * (RATE)) / 10;
++    c->proc = 0;
++    release(&p_min->lock);
++  }
++}
++#endif
++#ifdef FCFS
++void
++scheduler(void)
++{
++  struct proc *p;
++  struct proc *p_min = 0;
++  struct cpu *c = mycpu();
+ 
++  c->proc = 0;
++  for(;;) {
++    intr_on();
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        if(p_min == 0 || p_min->state != RUNNABLE || p->last_runnable_time < p_min->last_runnable_time)
++          p_min = p;
++      }
++      release(&p->lock);
++    }
++    acquire(&p_min->lock);
++    change_proc_state(p_min);
++    p_min->state = RUNNING;
++    c->proc = p_min;
++    swtch(&c->context, &p_min->context);
++    c->proc = 0;
++    release(&p_min->lock);
++  }
++}
++#endif
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -497,7 +610,9 @@ yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
++  change_proc_state(p);
+   p->state = RUNNABLE;
++  p->last_runnable_time = ticks;
+   sched();
+   release(&p->lock);
+ }
+@@ -542,6 +657,7 @@ sleep(void *chan, struct spinlock *lk)
+ 
+   // Go to sleep.
+   p->chan = chan;
++  change_proc_state(p);
+   p->state = SLEEPING;
+ 
+   sched();
+@@ -565,7 +681,9 @@ wakeup(void *chan)
+     if(p != myproc()){
+       acquire(&p->lock);
+       if(p->state == SLEEPING && p->chan == chan) {
++        change_proc_state(p);
+         p->state = RUNNABLE;
++        p->last_runnable_time = ticks;
+       }
+       release(&p->lock);
+     }
+@@ -586,7 +704,9 @@ kill(int pid)
+       p->killed = 1;
+       if(p->state == SLEEPING){
+         // Wake process from sleep().
++        change_proc_state(p);
+         p->state = RUNNABLE;
++        p->last_runnable_time = ticks;
+       }
+       release(&p->lock);
+       return 0;
+@@ -654,3 +774,72 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++pause_system(int seconds)
++{
++  struct proc *p;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if((p != myproc()->parent) && (p->pid != 1)) {
++      p->chan = (void*)&seconds;
++      if(p->state == RUNNING) {
++        change_proc_state(p);
++        p->state = RUNNABLE;
++        p->last_runnable_time = ticks; 
++      }
++    }
++  }
++
++  uint ticks0;
++  acquire(&tickslock);
++  ticks0 = ticks;
++  while(ticks - ticks0 < seconds * 10) {
++    if(myproc()->killed) {
++      release(&tickslock);
++      return -1;
++    }
++    sleep(&ticks, &tickslock);
++  }
++  release(&tickslock);
++
++  for(p = proc; p < &proc[NPROC]; p++)
++    if((p != myproc()->parent) && (p->pid != 1))
++      p->chan = 0;
++  return 0;
++}
++
++int
++kill_system(void)
++{
++  struct proc *p;
++  struct proc *my_p = myproc();
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if((p != my_p) && (p->pid != 1) && (p != my_p->parent)) {
++      if(kill(p->pid) < 0)
++        return -1;
++    }
++  }
++  kill(my_p->pid);
++  return 0;
++}
++
++int
++print_stats(void)
++{
++  printf("----------------------\n");
++  printf("Mean sleep time: %d\n", sleeping_processes_mean);
++  printf("Mean running time: %d\n", running_time_mean);
++  printf("Mean runnable time: %d\n", running_processes_mean);
++  printf("Program time: %d\n", program_time);
++  printf("CPU util: %d%\n", cpu_utilization);
++  printf("----------------------\n");
++  start_time = ticks;
++  sleeping_processes_mean = 0;
++  running_time_mean = 0;
++  running_processes_mean = 0;
++  program_time = 0;
++  cpu_utilization = 0;
++  num_of_procs_in_stats = 0;
++  return 0;
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..2a4942a 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -81,7 +81,7 @@ struct trapframe {
+ };
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+-
++#define RATE 5
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -92,6 +92,15 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  uint last_ticks;             // Amount of ticks in the last CPU burst
++  uint mean_ticks;             // Amount of mean ticks
++  uint last_runnable_time;     // Amount of last runnable time
++
++  //stats
++  uint last_change_time;
++  uint sleeping_time;
++  uint runnable_time;
++  uint running_time;
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..397af74 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_pause_system(void);
++extern uint64 sys_kill_system(void);
++extern uint64 sys_print_stats(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +130,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_pause_system] sys_pause_system,
++[SYS_kill_system] sys_kill_system,
++[SYS_print_stats] sys_print_stats
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..04a5f54 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_pause_system 22
++#define SYS_kill_system 23
++#define SYS_print_stats 24
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..8e550d2 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -95,3 +95,24 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_pause_system(void)
++{
++  int sec;
++  if(argint(0, &sec) < 0)
++    return -1;
++  return pause_system(sec);
++}
++
++uint64
++sys_kill_system(void)
++{
++  return kill_system();
++}
++
++uint64
++sys_print_stats(void)
++{
++  return print_stats();
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..570765b 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,9 +77,10 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
++  #ifdef DEFAULT
+   if(which_dev == 2)
+     yield();
+-
++  #endif
+   usertrapret();
+ }
+ 
+@@ -150,8 +151,10 @@ kerneltrap()
+   }
+ 
+   // give up the CPU if this is a timer interrupt.
++  #ifdef DEFAULT
+   if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
+     yield();
++  #endif
+ 
+   // the yield() may have caused some traps to occur,
+   // so restore trap registers for use by kernelvec.S's sepc instruction.
+diff --git a/user/env.c b/user/env.c
+new file mode 100644
+index 0000000..cfc3c8a
+--- /dev/null
++++ b/user/env.c
+@@ -0,0 +1,84 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++
++int loop_size = 10000;
++int large_interval = 10e2;
++int large_size = 30;
++int freq_interval = 30;
++int freq_size = 5;
++// int pid;
++
++void env(int size, int interval, char* env_name) {
++    int loop_len = 10e5;
++    int fork_n = size;
++    printf("Running %s:\n", env_name);
++    for (int i = 0; i < loop_len; i++) {
++        if (i % interval == 0) {
++            int pid = fork();
++            if (pid == 0) {
++                for(int j = 0; j < fork_n; j++) {
++                    int calculation = interval * interval * interval * interval * interval * interval * interval;
++                    calculation++;
++                    fork();
++                }
++                exit(0);
++            }
++            else wait(&pid);
++        } else if(i == loop_len / 2) pause_system(5);
++    }
++    exit(0);
++}
++
++void env_large() {
++    int pid = fork();
++    if(pid == 0) env(large_size, large_interval, "env_large");
++    else wait(&pid);
++}
++
++void env_freq() {
++    int pid = fork();
++    if(pid == 0) env(freq_size, freq_interval, "env_freq");
++    else wait(&pid);
++}
++
++int
++main(int argc, char *argv[])
++{
++    // int n_forks = 2;
++    // int pid = getpid();
++    // for (int i = 0; i < n_forks; i++) {
++    //     fork();
++    // }
++    // // int larges = 0;
++    // // int freqs = 0;
++    // int n_experiments = 10;
++    // for (int i = 0; i < n_experiments; i++) {
++    //     env_large(10, 3, 100);
++    //     if (pid == getpid()) {
++    //         printf("experiment %d/%d\n", i + 1, n_experiments);
++    //         // larges = (larges * i + get_utilization()) / (i + 1);
++    //     }
++    //     sleep(10);
++    //     env_freq(10, 100);
++    //     if (pid == getpid()) {
++    //         // freqs = (freqs * i + get_utilization()) / (i + 1);
++    //     }
++    // }
++    // if (pid == getpid()) {
++    //     // printf("larges = %d\nfreqs = %d\n", larges, freqs);
++    //     print_stats();
++    // }
++    print_stats();
++    env_freq();
++    print_stats();
++    env_large();
++    print_stats();
++    exit(0);
++}
+diff --git a/user/syscall.c b/user/syscall.c
+new file mode 100644
+index 0000000..a6e4c2c
+--- /dev/null
++++ b/user/syscall.c
+@@ -0,0 +1,74 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++
++void pause_system_dem(int interval, int pause_seconds, int loop_size) {
++    int pid = getpid();
++    for (int i = 0; i < loop_size; i++) {
++        if (i % interval == 0 && pid == getpid()) {
++            printf("pause system %d/%d completed.\n", i, loop_size);
++        }
++        if (i == loop_size / 2) {
++            pause_system(pause_seconds);
++        }
++    }
++    printf("\n");
++}
++
++void kill_system_dem(int interval, int loop_size) {
++    int pid = getpid();
++    for (int i = 0; i < loop_size; i++) {
++        if (i % interval == 0 && pid == getpid()) {
++            printf("kill system %d/%d completed.\n", i, loop_size);
++        }
++        if (i == loop_size / 2) {
++            kill_system();
++        }
++    }
++    printf("\n");
++}
++
++// void set_economic_mode_dem(int interval, int loop_size) {
++//     int pid = getpid();
++//     set_economic_mode(1);
++//     for (int i = 0; i < loop_size; i++) {
++//         if (i % interval == 0 && pid == getpid()) {
++//             printf("set economic mode %d/%d completed.\n", i, loop_size);
++//         }
++//         if (i == loop_size / 2) {
++//             set_economic_mode(0);
++//         }
++//     }
++//     printf("\n");
++// }
++
++void count(uint interval, uint loop_size){
++    int n_forks = 2;
++    for (int i = 0; i < n_forks; i++) {
++    	fork();
++    }
++
++    for (uint i = 0; i < loop_size; i++) {
++        if (i % interval == 0) {
++            printf("Count %d/%d completed.\n", i, loop_size);
++        }
++    }
++    printf("Count finished\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++    //set_economic_mode_dem(10, 100);
++    // pause_system_dem(10, 10, 100);
++    count(20000000, 100000000);
++    print_stats();
++    //kill_system_dem(10, 100);
++    exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..b566c3d 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int pause_system(int);
++int kill_system(void);
++int print_stats(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..062b29f 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("pause_system");
++entry("kill_system");
++entry("print_stats");

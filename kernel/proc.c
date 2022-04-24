@@ -834,5 +834,12 @@ print_stats(void)
   printf("Program time: %d\n", program_time);
   printf("CPU util: %d%\n", cpu_utilization);
   printf("----------------------\n");
+  start_time = ticks;
+  sleeping_processes_mean = 0;
+  running_time_mean = 0;
+  running_processes_mean = 0;
+  program_time = 0;
+  cpu_utilization = 0;
+  num_of_procs_in_stats = 0;
   return 0;
 }
